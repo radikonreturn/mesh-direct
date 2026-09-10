@@ -1,0 +1,74 @@
+$dt-background: #11161c;
+$dt-panel: #18212a;
+$dt-panel-alt: #202b35;
+$dt-text: #d9e2ea;
+$dt-muted: #8fa0ad;
+$dt-accent: #65b8c4;
+$dt-warning: #d9ad67;
+$dt-danger: #dc7a7a;
+
+Screen {
+    background: $dt-background;
+    color: $dt-text;
+}
+
+#title, .screen-title {
+    height: 2;
+    padding: 1 2 0 2;
+    color: $dt-text;
+    text-style: bold;
+}
+
+#subtitle, .screen-help {
+    height: 2;
+    padding: 0 2;
+    color: $dt-muted;
+}
+
+.section {
+    margin: 0 1 1 1;
+    border: round #33414d;
+    background: $dt-panel;
+    height: 1fr;
+}
+
+.transfers-section { height: 2fr; }
+.section-title { height: 2; padding: 0 1; color: $dt-accent; text-style: bold; }
+DataTable { height: 1fr; background: $dt-panel; }
+DataTable > .datatable--header { background: $dt-panel-alt; color: $dt-muted; text-style: bold; }
+DataTable > .datatable--cursor { background: #29414a; color: $dt-text; }
+#inbox-table { height: 2fr; }
+#inbox-detail {
+    height: 2fr;
+    padding: 1 2;
+    background: $dt-panel;
+    color: $dt-text;
+}
+
+#status {
+    height: 1;
+    padding: 0 2;
+    color: $dt-muted;
+}
+#status.error, #dialog-error { color: $dt-danger; }
+Footer { background: $dt-panel-alt; color: $dt-muted; }
+Footer > .footer--key { color: $dt-accent; }
+
+ModalScreen { align: center middle; background: rgba(8, 12, 16, 0.75); }
+.dialog {
+    width: 64;
+    height: auto;
+    padding: 1 2;
+    background: $dt-panel;
+    border: round #526370;
+}
+.trust-dialog { width: 68; }
+.dialog-title { height: 2; color: $dt-text; text-style: bold; }
+.field-label { height: 1; margin-top: 1; color: $dt-muted; }
+Input { background: $dt-background; border: tall #3a4955; }
+Input:focus { border: tall $dt-accent; }
+.dialog-actions { height: 3; align-horizontal: right; margin-top: 1; }
+.dialog-actions Button { margin-left: 1; min-width: 14; }
+.identity-block { padding: 1; background: $dt-background; color: $dt-text; }
+.dialog-help { margin-top: 1; color: $dt-warning; }
+#dialog-error { height: 1; margin-top: 1; }
