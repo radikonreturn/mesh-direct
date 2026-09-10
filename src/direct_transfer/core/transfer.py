@@ -32,6 +32,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -127,6 +128,13 @@ class TransferCancelled(ConnectionError):
     """A user deliberately cancelled an active transfer."""
 
 
+class ServerState(Enum):
+    STARTING = "starting"
+    LISTENING = "listening"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
 # ─── FileServer (Threaded TCP Receiver) ───────────────────────────
 
 
@@ -175,6 +183,11 @@ class FileServer(threading.Thread):
         self._running = threading.Event()
         self._running.set()
         self._server_socket: socket.socket | None = None
+        self._startup_event = threading.Event()
+        self._state = ServerState.STARTING
+        self._startup_error: str | None = None
+        self._listener_family: socket.AddressFamily | None = None
+        self._dual_stack = False
         self._transfers: list[TransferInfo] = []
         self._transfer_index: dict[tuple[str, str], TransferInfo] = {}
         self._lock = threading.Lock()
@@ -239,34 +252,35 @@ class FileServer(threading.Thread):
 
     def run(self) -> None:
         """TCP accept loop: receive file sessions from peers."""
-        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.settimeout(1.0)
-
         try:
-            self._server_socket.bind(("", self._port))
-            self._server_socket.listen(TRANSFER_BACKLOG)
-        except OSError as e:
+            self._server_socket = self._bind_listener()
+        except OSError as error:
+            self._state = ServerState.FAILED
+            self._startup_error = str(error)
+            self._startup_event.set()
             if self._running.is_set():
-                log.error("Cannot bind TCP server on port %d: %s", self._port, e)
+                log.error("Cannot bind TCP server on port %d: %s", self._port, error)
             else:
-                log.debug("Transfer server stopped during startup: %s", e)
+                log.debug("Transfer server stopped during startup: %s", error)
             return
 
+        self._state = ServerState.LISTENING
+        self._startup_event.set()
         log.info("FileServer listening on port %d", self._port)
 
         while self._running.is_set():
             try:
                 conn, addr = self._server_socket.accept()
+                peer_ip = self._normalize_peer_ip(addr[0])
                 if not self._session_slots.acquire(blocking=False):
-                    log.warning("Transfer session limit reached; rejecting %s", addr[0])
+                    log.warning("Transfer session limit reached; rejecting %s", peer_ip)
                     conn.close()
                     continue
                 handler = threading.Thread(
                     target=self._session_worker,
-                    args=(conn, addr[0]),
+                    args=(conn, peer_ip),
                     daemon=True,
-                    name=f"recv-{addr[0]}",
+                    name=f"recv-{peer_ip}",
                 )
                 with self._resource_lock:
                     self._connections.add(conn)
@@ -280,7 +294,74 @@ class FileServer(threading.Thread):
                 break
 
         self._server_socket.close()
+        self._state = ServerState.STOPPED
         log.info("FileServer stopped")
+
+    def _bind_listener(self) -> socket.socket:
+        """Prefer a dual-stack IPv6 listener and safely fall back to IPv4."""
+        failures: list[OSError] = []
+        if socket.has_ipv6:
+            listener: socket.socket | None = None
+            try:
+                listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "IPV6_V6ONLY"):
+                    listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                listener.bind(("::", self._port))
+                listener.listen(TRANSFER_BACKLOG)
+                listener.settimeout(1.0)
+                self._listener_family = socket.AF_INET6
+                self._dual_stack = (
+                    not hasattr(socket, "IPV6_V6ONLY")
+                    or listener.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 0
+                )
+                return listener
+            except OSError as error:
+                failures.append(error)
+                if listener is not None:
+                    listener.close()
+
+        ipv4_listener: socket.socket | None = None
+        try:
+            ipv4_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ipv4_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ipv4_listener.bind(("", self._port))
+            ipv4_listener.listen(TRANSFER_BACKLOG)
+            ipv4_listener.settimeout(1.0)
+            self._listener_family = socket.AF_INET
+            self._dual_stack = False
+            return ipv4_listener
+        except OSError as error:
+            failures.append(error)
+            if ipv4_listener is not None:
+                with contextlib.suppress(OSError):
+                    ipv4_listener.close()
+            raise failures[-1] from error
+
+    @staticmethod
+    def _normalize_peer_ip(value: str) -> str:
+        prefix = "::ffff:"
+        return value[len(prefix) :] if value.lower().startswith(prefix) else value
+
+    def wait_for_startup(self, timeout: float = 2.0) -> ServerState:
+        self._startup_event.wait(timeout)
+        return self._state
+
+    @property
+    def state(self) -> ServerState:
+        return self._state
+
+    @property
+    def startup_error(self) -> str | None:
+        return self._startup_error
+
+    @property
+    def listener_family(self) -> socket.AddressFamily | None:
+        return self._listener_family
+
+    @property
+    def dual_stack(self) -> bool:
+        return self._dual_stack
 
     def shutdown(self) -> None:
         """Stop accepting and wake bounded active/pending session workers."""
@@ -1336,12 +1417,16 @@ class SecureTransfer:
             approval_timeout=approval_timeout,
         )
 
-    def start_server(self) -> None:
+    def start_server(self, timeout: float = 2.0) -> ServerState:
         """Start the TCP file-receive server in a background thread."""
         if self._server.is_alive():
-            return
+            return self._server.wait_for_startup(timeout)
+        if self._server.state in {ServerState.FAILED, ServerState.STOPPED}:
+            return self._server.state
         self._server.start()
-        log.info("Transfer server started on port %d", self._port)
+        state = self._server.wait_for_startup(timeout)
+        log.info("Transfer server startup on port %d: %s", self._port, state.value)
+        return state
 
     def stop_server(self) -> None:
         """Stop accepting, cancel outgoing workers, and close active sockets."""

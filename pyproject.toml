@@ -13,6 +13,7 @@ dependencies = [
   "click>=8.1",
   "cryptography>=41",
   "platformdirs>=3.6",
+  "psutil>=5.9",
   "textual>=0.47",
 ]
 

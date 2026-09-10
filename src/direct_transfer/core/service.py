@@ -10,8 +10,10 @@ from pathlib import Path
 
 from direct_transfer.core.address_book import AddressBook, AddressBookEntry
 from direct_transfer.core.endpoint import Endpoint
+from direct_transfer.core.events import EventPublisher, PairingOffered, PeerStateChanged
 from direct_transfer.core.history import TransferHistoryStore, TransferRecord
 from direct_transfer.core.identity import DeviceIdentity
+from direct_transfer.core.local_address import primary_local_ipv4
 from direct_transfer.core.pairing import PairingIdentity, PairingInbox, client_pair
 from direct_transfer.core.paths import AppPaths
 from direct_transfer.core.session import (
@@ -19,7 +21,7 @@ from direct_transfer.core.session import (
     ProtocolError,
     client_handshake,
 )
-from direct_transfer.core.transfer import SecureTransfer
+from direct_transfer.core.transfer import SecureTransfer, ServerState
 from direct_transfer.core.trust import TrustStatus, TrustStore
 from direct_transfer.utils.config import (
     CONNECT_TIMEOUT,
@@ -45,6 +47,18 @@ class ConnectionResult:
     resolved_ip: str
     identity: PairingIdentity
     state: ConnectionState
+
+
+@dataclass(frozen=True)
+class ResolvedAddress:
+    family: socket.AddressFamily
+    socket_type: socket.SocketKind
+    protocol: int
+    socket_address: tuple
+
+    @property
+    def ip(self) -> str:
+        return str(self.socket_address[0])
 
 
 @dataclass(frozen=True)
@@ -74,6 +88,8 @@ class DirectPeerService:
         self.history = TransferHistoryStore(self.paths.history)
         self.pairing_inbox = PairingInbox()
         self.port = port
+        self.local_ipv4 = primary_local_ipv4()
+        self.events = EventPublisher()
         self._outbound_pairings: dict[str, tuple[PairingIdentity, Endpoint]] = {}
         self._resolved: dict[str, _ResolvedPeer] = {}
         self.transfer = SecureTransfer(
@@ -84,12 +100,13 @@ class DirectPeerService:
             peer_resolver=self._resolve_peer,
             history_store=self.history,
             approval_timeout=approval_timeout,
-            on_pairing=self.pairing_inbox.publish,
+            on_pairing=self._publish_pairing,
             partial_dir=str(self.paths.partials),
         )
+        self.transfer.events.subscribe(self.events.publish)
 
-    def start(self) -> None:
-        self.transfer.start_server()
+    def start(self, timeout: float = 2.0) -> ServerState:
+        return self.transfer.start_server(timeout)
 
     def stop(self) -> None:
         self.transfer.stop_server()
@@ -102,16 +119,12 @@ class DirectPeerService:
         target = Endpoint.parse(endpoint) if isinstance(endpoint, str) else endpoint
         if progress:
             progress("Resolving")
-        resolved_ip = self._resolve(target)
-        if progress:
-            progress("Connecting")
         try:
-            with socket.create_connection(
-                (resolved_ip, target.port), timeout=CONNECT_TIMEOUT
-            ) as connection:
+            connection, resolved = self._open_connection(target, progress)
+            with connection:
                 connection.settimeout(HANDSHAKE_TIMEOUT)
-                remote = client_pair(connection, self.identity, resolved_ip, self.port)
-        except Exception as error:
+                remote = client_pair(connection, self.identity, resolved.ip, self.port)
+        except (AuthenticationError, ProtocolError, ValueError, OSError) as error:
             raise self._friendly_error(error) from error
         status = self.trust_store.assess(remote.device_id, remote.public_key)
         known_at_endpoint = self.address_book.find_endpoint(target.host, target.port)
@@ -127,10 +140,10 @@ class DirectPeerService:
         self._outbound_pairings[remote.device_id] = (remote, target)
         if progress:
             progress("Identity received")
-        self._resolved[resolved_ip] = _ResolvedPeer(
+        self._resolved[resolved.ip] = _ResolvedPeer(
             remote.device_id, remote.public_key, status, target.host
         )
-        return ConnectionResult(target, resolved_ip, remote, state)
+        return ConnectionResult(target, resolved.ip, remote, state)
 
     def connect(
         self,
@@ -151,24 +164,23 @@ class DirectPeerService:
         if trusted is None:
             return result
         try:
-            with socket.create_connection(
-                (result.resolved_ip, result.endpoint.port), timeout=CONNECT_TIMEOUT
-            ) as connection:
+            connection, resolved = self._open_connection(result.endpoint, progress)
+            with connection:
                 connection.settimeout(HANDSHAKE_TIMEOUT)
                 client_handshake(connection, self.identity, trusted)
-        except Exception as error:
+        except (AuthenticationError, ProtocolError, ValueError, OSError) as error:
             self.address_book.record_error(
                 result.identity.device_id, str(self._friendly_error(error))
             )
             raise self._friendly_error(error) from error
         self.address_book.record_success(
-            result.identity.device_id, result.endpoint, result.resolved_ip
+            result.identity.device_id, result.endpoint, resolved.ip
         )
         if progress:
             progress("Authenticated")
         return ConnectionResult(
             result.endpoint,
-            result.resolved_ip,
+            resolved.ip,
             result.identity,
             ConnectionState.AUTHENTICATED,
         )
@@ -200,11 +212,20 @@ class DirectPeerService:
         self._resolved[identity.peer_ip] = _ResolvedPeer(
             device_id, identity.public_key, TrustStatus.TRUSTED, endpoint.host
         )
+        self.events.publish(PeerStateChanged(device_id))
         return entry
+
+    def dismiss_pairing(self, device_id: str) -> bool:
+        removed = self.pairing_inbox.reject(device_id)
+        if removed:
+            self.events.publish(PeerStateChanged(device_id))
+        return removed
 
     def forget_device(self, device_id: str) -> bool:
         removed = self.trust_store.untrust(device_id)
         self.address_book.forget(device_id)
+        if removed:
+            self.events.publish(PeerStateChanged(device_id))
         return removed
 
     def send_files(
@@ -213,6 +234,7 @@ class DirectPeerService:
         paths: list[str | Path],
         message: str | None = None,
     ) -> str:
+        connected: ConnectionResult | None = None
         if isinstance(device_id_or_endpoint, Endpoint):
             connected = self.connect(device_id_or_endpoint)
             if connected.state != ConnectionState.AUTHENTICATED:
@@ -229,7 +251,11 @@ class DirectPeerService:
         trusted = self.trust_store.get(device_id)
         if entry is None or trusted is None:
             raise AuthenticationError("Peer is not trusted")
-        resolved_ip = self._resolve(entry.endpoint)
+        if connected is None:
+            connected = self.connect(entry.endpoint)
+        if connected.state != ConnectionState.AUTHENTICATED:
+            raise AuthenticationError("Peer authentication failed")
+        resolved_ip = connected.resolved_ip
         self._resolved[resolved_ip] = _ResolvedPeer(
             device_id, trusted.public_key, TrustStatus.TRUSTED, entry.last_hostname
         )
@@ -256,19 +282,76 @@ class DirectPeerService:
         return self.history.list_transfers(limit=limit)
 
     def _resolve_peer(self, peer_ip: str):
-        return self._resolved.get(peer_ip)
+        resolved = self._resolved.get(peer_ip)
+        if resolved is not None:
+            return resolved
+        entry = self.address_book.get(peer_ip)
+        if entry is None:
+            return None
+        return _ResolvedPeer(
+            entry.device_id,
+            entry.public_key,
+            TrustStatus.TRUSTED,
+            entry.friendly_name,
+        )
 
     @staticmethod
-    def _resolve(endpoint: Endpoint) -> str:
+    def _resolve_candidates(endpoint: Endpoint) -> tuple[ResolvedAddress, ...]:
         try:
             records = socket.getaddrinfo(
-                endpoint.host, endpoint.port, type=socket.SOCK_STREAM
+                endpoint.host,
+                endpoint.port,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
             )
         except socket.gaierror as error:
             raise DirectConnectionError("Host not found") from error
-        if not records:
+        candidates: list[ResolvedAddress] = []
+        seen: set[tuple] = set()
+        for family, socket_type, protocol, _canonical_name, socket_address in records:
+            if family not in {socket.AF_INET, socket.AF_INET6}:
+                continue
+            key = (family, socket_type, protocol, socket_address)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                ResolvedAddress(family, socket_type, protocol, socket_address)
+            )
+        if not candidates:
             raise DirectConnectionError("Host not found")
-        return records[0][4][0]
+        return tuple(candidates)
+
+    @classmethod
+    def _open_connection(
+        cls,
+        endpoint: Endpoint,
+        progress: Callable[[str], None] | None = None,
+    ) -> tuple[socket.socket, ResolvedAddress]:
+        candidates = cls._resolve_candidates(endpoint)
+        failures: list[OSError] = []
+        for candidate in candidates:
+            if progress:
+                progress("Connecting")
+            connection: socket.socket | None = None
+            try:
+                connection = socket.socket(
+                    candidate.family, candidate.socket_type, candidate.protocol
+                )
+                connection.settimeout(CONNECT_TIMEOUT)
+                connection.connect(candidate.socket_address)
+                return connection, candidate
+            except OSError as error:
+                failures.append(error)
+                if connection is not None:
+                    connection.close()
+        if not failures:
+            raise DirectConnectionError("Peer is unreachable")
+        raise cls._friendly_error(failures[-1])
+
+    def _publish_pairing(self, identity: PairingIdentity) -> None:
+        self.pairing_inbox.publish(identity)
+        self.events.publish(PairingOffered(identity))
 
     @staticmethod
     def _friendly_error(error: Exception) -> DirectConnectionError:
@@ -279,11 +362,12 @@ class DirectPeerService:
         if isinstance(error, ConnectionRefusedError):
             return DirectConnectionError("Connection refused")
         if isinstance(error, AuthenticationError):
-            return DirectConnectionError(str(error) or "Authentication failed")
+            return DirectConnectionError("Authentication failed")
         if isinstance(error, ProtocolError):
-            return DirectConnectionError(
-                str(error) or "Peer uses incompatible protocol"
-            )
+            detail = str(error).casefold()
+            if "incompatible" in detail or "version" in detail:
+                return DirectConnectionError("Peer uses incompatible protocol")
+            return DirectConnectionError("Authentication failed")
         if isinstance(error, OSError):
-            return DirectConnectionError("Peer is unreachable")
+            return DirectConnectionError("Peer unreachable")
         return DirectConnectionError("Connection failed")

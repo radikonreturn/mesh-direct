@@ -26,6 +26,7 @@ class InboxScreen(Screen):
         table = self.query_one(DataTable)
         table.add_columns("Sender", "Device", "Files", "Size", "Message")
         self.refresh_rows()
+        self.set_interval(1.0, self.refresh_rows)
 
     def refresh_rows(self) -> None:
         table = self.query_one(DataTable)
@@ -126,6 +127,7 @@ class TrustedScreen(Screen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
         ("a", "approve", "Approve pairing"),
+        ("r", "reject_pairing", "Reject pairing"),
         ("f", "forget", "Forget"),
     ]
 
@@ -141,6 +143,13 @@ class TrustedScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.add_columns("Name", "Device ID", "Fingerprint", "Address", "State")
+        self.refresh_rows()
+        self.set_interval(1.0, self.refresh_rows)
+
+    def refresh_rows(self) -> None:
+        table = self.query_one(DataTable)
+        selected = table.cursor_row
+        table.clear()
         for item in self.app.service.pairing_inbox.all():
             table.add_row(
                 item.peer_ip,
@@ -159,6 +168,8 @@ class TrustedScreen(Screen):
                 "TRUSTED",
                 key=item.device_id,
             )
+        if table.row_count and selected is not None:
+            table.move_cursor(row=min(selected, table.row_count - 1))
 
     def action_approve(self) -> None:
         table = self.query_one(DataTable)
@@ -169,9 +180,20 @@ class TrustedScreen(Screen):
             self.notify("Select an awaiting pairing request", severity="warning")
             return
         self.app.service.trust(key.removeprefix("pending:"))
-        table.clear(columns=True)
-        self.on_mount()
+        self.refresh_rows()
         self.notify("Device trusted; the peer can now reconnect")
+
+    def action_reject_pairing(self) -> None:
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        key = str(table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value)
+        if not key.startswith("pending:"):
+            self.notify("Select an awaiting pairing request", severity="warning")
+            return
+        if self.app.service.dismiss_pairing(key.removeprefix("pending:")):
+            self.refresh_rows()
+            self.notify("Pairing request dismissed")
 
     def action_forget(self) -> None:
         table = self.query_one(DataTable)
@@ -184,7 +206,7 @@ class TrustedScreen(Screen):
             self.notify("Approve or leave the pending request", severity="warning")
             return
         if self.app.service.forget_device(device_id):
-            table.remove_row(device_id)
+            self.refresh_rows()
             self.notify("Device forgotten")
 
 

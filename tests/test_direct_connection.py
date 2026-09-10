@@ -101,10 +101,9 @@ def test_resolution_failure(app_paths, free_port, monkeypatch):
 
 def test_timeout_has_clear_error(app_paths, free_port, monkeypatch):
     service = DirectPeerService(port=free_port(), paths=app_paths("client"))
-    monkeypatch.setattr(service, "_resolve", lambda endpoint: "192.0.2.1")
     monkeypatch.setattr(
-        socket,
-        "create_connection",
+        service,
+        "_open_connection",
         lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError()),
     )
     with pytest.raises(DirectConnectionError, match="timed out"):
@@ -127,5 +126,5 @@ def test_protocol_mismatch(app_paths, free_port):
 
     threading.Thread(target=incompatible, daemon=True).start()
     service = DirectPeerService(port=free_port(), paths=app_paths("client"))
-    with pytest.raises(DirectConnectionError, match="incompatible pairing protocol"):
+    with pytest.raises(DirectConnectionError, match="incompatible protocol"):
         service.pair(Endpoint("127.0.0.1", port))

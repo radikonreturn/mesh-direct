@@ -12,7 +12,26 @@ Screen {
     color: $dt-text;
 }
 
-#title, .screen-title {
+#topbar {
+    height: 2;
+    padding: 1 2 0 2;
+}
+
+#title {
+    width: 1fr;
+    height: 1;
+    color: $dt-text;
+    text-style: bold;
+}
+
+#local-address {
+    width: auto;
+    height: 1;
+    color: $dt-muted;
+    text-align: right;
+}
+
+.screen-title {
     height: 2;
     padding: 1 2 0 2;
     color: $dt-text;

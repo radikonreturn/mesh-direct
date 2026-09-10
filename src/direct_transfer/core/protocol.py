@@ -62,10 +62,7 @@ def receive_data_frame(sock: socket.socket, key: bytes) -> bytes:
 def _is_reserved_filename(name: str) -> bool:
     if hasattr(os.path, "isreserved"):
         return os.path.isreserved(name)
-    try:
-        return PureWindowsPath(name).is_reserved()
-    except Exception:
-        return False
+    return PureWindowsPath(name).is_reserved()
 
 
 def sanitize_filename(value: str) -> str:

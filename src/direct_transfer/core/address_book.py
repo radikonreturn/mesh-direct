@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
+import math
 import os
 import tempfile
 import threading
@@ -16,6 +19,9 @@ from direct_transfer.core.identity import (
     device_id_from_public_key,
     fingerprint_from_public_key,
 )
+from direct_transfer.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,18 +70,50 @@ class AddressBook:
             )
 
     def put(self, entry: AddressBookEntry) -> None:
-        if (
-            not DEVICE_ID_PATTERN.fullmatch(entry.device_id)
-            or device_id_from_public_key(entry.public_key) != entry.device_id
-            or fingerprint_from_public_key(entry.public_key) != entry.fingerprint
-        ):
-            raise ValueError("Invalid device ID")
-        Endpoint(entry.last_hostname, entry.transfer_port)
-        if not entry.friendly_name or len(entry.friendly_name) > 80:
-            raise ValueError("Invalid friendly name")
+        self._validate_entry(entry)
         with self._lock:
             self._entries[entry.device_id] = entry
             self._save()
+
+    @staticmethod
+    def _validate_entry(entry: AddressBookEntry) -> None:
+        try:
+            valid_identity = (
+                isinstance(entry.device_id, str)
+                and DEVICE_ID_PATTERN.fullmatch(entry.device_id) is not None
+                and device_id_from_public_key(entry.public_key) == entry.device_id
+                and fingerprint_from_public_key(entry.public_key) == entry.fingerprint
+            )
+        except (TypeError, ValueError, base64.binascii.Error):
+            valid_identity = False
+        if not valid_identity:
+            raise ValueError("Invalid cryptographic identity")
+        Endpoint(entry.last_hostname, entry.transfer_port)
+        if (
+            not isinstance(entry.friendly_name, str)
+            or not entry.friendly_name
+            or entry.friendly_name != entry.friendly_name.strip()
+            or len(entry.friendly_name) > 80
+            or not entry.friendly_name.isprintable()
+        ):
+            raise ValueError("Invalid friendly name")
+        if entry.last_resolved_ip is not None:
+            if not isinstance(entry.last_resolved_ip, str):
+                raise ValueError("Invalid resolved address")
+            ipaddress.ip_address(entry.last_resolved_ip)
+        timestamp = entry.last_successful_connection
+        if timestamp is not None and (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(float(timestamp))
+            or timestamp < 0
+        ):
+            raise ValueError("Invalid connection timestamp")
+        error = entry.last_connection_error
+        if error is not None and (
+            not isinstance(error, str) or len(error) > 512 or not error.isprintable()
+        ):
+            raise ValueError("Invalid connection error")
 
     def record_success(
         self, device_id: str, endpoint: Endpoint, resolved_ip: str
@@ -111,27 +149,38 @@ class AddressBook:
     def _load(self) -> None:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise TypeError("address book must be an object")
             records = raw.get("devices", {})
             if not isinstance(records, dict):
-                return
-            for key, value in records.items():
-                entry = AddressBookEntry(**value)
-                if (
-                    key == entry.device_id
-                    and device_id_from_public_key(entry.public_key) == entry.device_id
-                    and fingerprint_from_public_key(entry.public_key)
-                    == entry.fingerprint
-                ):
-                    Endpoint(entry.last_hostname, entry.transfer_port)
-                    self._entries[key] = entry
-        except (
-            FileNotFoundError,
-            OSError,
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-        ):
+                raise TypeError("devices must be an object")
+        except FileNotFoundError:
+            return
+        except (OSError, TypeError, json.JSONDecodeError) as error:
+            log.warning("Ignoring invalid address book %s: %s", self.path, error)
             self._entries = {}
+            return
+
+        loaded: dict[str, AddressBookEntry] = {}
+        for key, value in records.items():
+            try:
+                if not isinstance(value, dict):
+                    raise TypeError("record must be an object")
+                entry = AddressBookEntry(**value)
+                if key != entry.device_id:
+                    raise ValueError("record key does not match device ID")
+                self._validate_entry(entry)
+            except (
+                TypeError,
+                ValueError,
+                base64.binascii.Error,
+            ) as error:
+                log.warning(
+                    "Skipping invalid address record %s: %s", str(key)[:24], error
+                )
+                continue
+            loaded[key] = entry
+        self._entries = loaded
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

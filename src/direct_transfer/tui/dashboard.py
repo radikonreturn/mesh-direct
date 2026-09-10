@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Label, Static
 
 from direct_transfer.core.endpoint import Endpoint
+from direct_transfer.core.events import (
+    CoreEvent,
+    IncomingTransferOffered,
+    PairingOffered,
+    PeerStateChanged,
+)
 from direct_transfer.core.service import (
     ConnectionResult,
     ConnectionState,
     DirectConnectionError,
     DirectPeerService,
 )
+from direct_transfer.core.transfer import ServerState
 from direct_transfer.tui.modals import ConnectDialog, SendDialog, TrustDialog
 from direct_transfer.tui.screens import HistoryScreen, InboxScreen, TrustedScreen
 
@@ -34,9 +42,15 @@ class DirectTransferApp(App):
         super().__init__()
         self.service = service
         self._selected_device: str | None = None
+        self._ui_thread_id: int | None = None
 
     def compose(self) -> ComposeResult:
-        yield Label("Direct Transfer", id="title")
+        local_address = self.service.local_ipv4 or "—"
+        with Horizontal(id="topbar"):
+            yield Label("Direct Transfer", id="title")
+            yield Static(
+                f"LOCAL {local_address}:{self.service.port}", id="local-address"
+            )
         yield Static(
             "Directly reachable peers · authenticated end to end", id="subtitle"
         )
@@ -46,20 +60,63 @@ class DirectTransferApp(App):
         with Vertical(classes="section transfers-section"):
             yield Label("Transfers", classes="section-title")
             yield DataTable(id="transfers")
-        yield Static("Ready · listening for authenticated connections", id="status")
+        yield Static("Starting listener", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
+        self._ui_thread_id = threading.get_ident()
+        self.service.events.subscribe(self._on_core_event)
         peers = self.query_one("#peers", DataTable)
         peers.add_columns("Name", "Address", "Trust", "Last")
         transfers = self.query_one("#transfers", DataTable)
         transfers.add_columns("File", "Peer", "Progress", "Speed", "Status")
-        self.service.start()
+        state = self.service.start()
+        if state == ServerState.LISTENING:
+            address = self.service.local_ipv4 or "—"
+            self._set_status(f"Listening · {address}:{self.service.port}")
+        elif state == ServerState.FAILED:
+            self._set_status(
+                f"Unable to listen on port {self.service.port}", error=True
+            )
+        else:
+            self._set_status("Listener startup timed out", error=True)
         self.refresh_data()
         self.set_interval(0.5, self.refresh_data)
 
     def on_unmount(self) -> None:
+        self.service.events.unsubscribe(self._on_core_event)
         self.service.stop()
+
+    def _on_core_event(self, event: CoreEvent) -> None:
+        if threading.get_ident() == self._ui_thread_id:
+            self._apply_core_event(event)
+        else:
+            self.call_from_thread(self._apply_core_event, event)
+
+    def _apply_core_event(self, event: CoreEvent) -> None:
+        if isinstance(event, IncomingTransferOffered):
+            request = event.request
+            sender = request.peer_name or request.peer_device_id
+            self.notify(
+                f"Incoming transfer from {sender} · {len(request.files)} "
+                f"files · {_size(request.total_size)}\nPress I to review",
+                title="Incoming transfer",
+                timeout=8,
+            )
+            if isinstance(self.screen, InboxScreen):
+                self.screen.refresh_rows()
+        elif isinstance(event, PairingOffered):
+            self.notify(
+                f"Pairing request from {event.identity.peer_ip}\nPress T to review",
+                title="New pairing request",
+                timeout=8,
+            )
+            if isinstance(self.screen, TrustedScreen):
+                self.screen.refresh_rows()
+        elif isinstance(event, PeerStateChanged):
+            self.refresh_data()
+            if isinstance(self.screen, TrustedScreen):
+                self.screen.refresh_rows()
 
     def refresh_data(self) -> None:
         peers = self.query_one("#peers", DataTable)
@@ -166,3 +223,14 @@ class DirectTransferApp(App):
 
     def action_trusted(self) -> None:
         self.push_screen(TrustedScreen())
+
+
+def _size(value: int) -> str:
+    amount = float(value)
+    for suffix in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024 or suffix == "TB":
+            return (
+                f"{amount:.0f} {suffix}" if suffix == "B" else f"{amount:.1f} {suffix}"
+            )
+        amount /= 1024
+    return str(value)
